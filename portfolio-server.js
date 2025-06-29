@@ -1,14 +1,41 @@
 const express = require('express');
 const cors = require('cors');
 const multer = require('multer');
+const mammoth = require('mammoth');
+const fs = require('fs');
+const path = require('path');
 
 const app = express();
 const PORT = parseInt(process.env.PORT || '3000', 10);
 
+// Create uploads directory if it doesn't exist
+const uploadsDir = path.join(__dirname, 'uploads');
+if (!fs.existsSync(uploadsDir)) {
+  fs.mkdirSync(uploadsDir, { recursive: true });
+}
+
 // Configure multer for file uploads
+const storage = multer.diskStorage({
+  destination: function (req, file, cb) {
+    cb(null, uploadsDir);
+  },
+  filename: function (req, file, cb) {
+    const timestamp = Date.now();
+    const originalName = file.originalname.replace(/\s+/g, '-');
+    cb(null, `${timestamp}-${originalName}`);
+  }
+});
+
 const upload = multer({ 
-  storage: multer.memoryStorage(),
-  limits: { fileSize: 10 * 1024 * 1024 }
+  storage: storage,
+  limits: { fileSize: 10 * 1024 * 1024 },
+  fileFilter: function (req, file, cb) {
+    if (file.mimetype === 'application/vnd.openxmlformats-officedocument.wordprocessingml.document') {
+      cb(null, true);
+    } else {
+      cb(new Error('Only DOCX files are allowed'), false);
+    }
+  }
 });
 
 // Sample data
@@ -112,27 +139,69 @@ app.get('/api/blog/:slug', (req, res) => {
   post ? res.json(post) : res.status(404).json({ error: 'Blog post not found' });
 });
 
-app.post('/api/blog/upload', upload.single('docx'), (req, res) => {
+app.post('/api/blog/upload', upload.single('docx'), async (req, res) => {
   if (!req.file) {
     return res.status(400).json({ error: 'No file uploaded' });
   }
 
-  const title = req.file.originalname.replace('.docx', '');
-  const slug = title.toLowerCase().replace(/[^a-z0-9\s-]/g, '').replace(/\s+/g, '-');
-  
-  const newPost = {
-    id: blogPosts.length + 1,
-    title,
-    slug,
-    content: `Blog post created from uploaded file: ${req.file.originalname}`,
-    excerpt: `Article created from ${req.file.originalname}`,
-    published: false,
-    createdAt: new Date(),
-    tags: ['Upload', 'Demo']
-  };
+  try {
+    // Extract text from DOCX file using mammoth
+    const result = await mammoth.extractRawText({ path: req.file.path });
+    const extractedText = result.value;
+    
+    // Get title from filename or first line of content
+    let title = req.file.originalname.replace('.docx', '').replace(/[-_]/g, ' ');
+    const firstLine = extractedText.split('\n')[0];
+    if (firstLine && firstLine.length > 0 && firstLine.length < 100) {
+      title = firstLine.trim();
+    }
+    
+    // Create slug from title
+    const slug = title.toLowerCase()
+      .replace(/[^a-z0-9\s-]/g, '')
+      .replace(/\s+/g, '-')
+      .substring(0, 50);
+    
+    // Create excerpt from first 200 characters
+    const excerpt = extractedText.substring(0, 200).trim() + '...';
+    
+    // Create new blog post
+    const newPost = {
+      id: blogPosts.length + 1,
+      title,
+      slug,
+      content: extractedText,
+      excerpt,
+      published: false,
+      createdAt: new Date(),
+      tags: ['Article', 'Upload'],
+      filePath: req.file.path,
+      originalFileName: req.file.originalname
+    };
 
-  blogPosts.push(newPost);
-  res.status(201).json(newPost);
+    blogPosts.push(newPost);
+    
+    console.log(`New blog post created: "${title}" from file: ${req.file.originalname}`);
+    
+    res.status(201).json({
+      message: 'Article created successfully from DOCX file',
+      post: newPost,
+      extractedLength: extractedText.length
+    });
+    
+  } catch (error) {
+    console.error('Error processing DOCX file:', error);
+    
+    // Clean up uploaded file if processing failed
+    if (req.file.path && fs.existsSync(req.file.path)) {
+      fs.unlinkSync(req.file.path);
+    }
+    
+    res.status(500).json({ 
+      error: 'Failed to process DOCX file',
+      details: error.message 
+    });
+  }
 });
 
 app.post('/api/contact', (req, res) => {
@@ -147,6 +216,64 @@ app.post('/api/contact', (req, res) => {
 });
 
 app.get('/api/contact', (req, res) => res.json(contactMessages));
+
+// Get all blog posts including drafts (admin endpoint)
+app.get('/api/blog/admin', (req, res) => {
+  const postsWithFileInfo = blogPosts.map(post => {
+    const fileExists = post.filePath ? fs.existsSync(post.filePath) : false;
+    return {
+      ...post,
+      fileExists,
+      wordCount: post.content ? post.content.split(/\s+/).length : 0
+    };
+  });
+  res.json(postsWithFileInfo);
+});
+
+// Publish/unpublish blog post
+app.patch('/api/blog/:id/publish', (req, res) => {
+  const postId = parseInt(req.params.id);
+  const post = blogPosts.find(p => p.id === postId);
+  if (!post) {
+    return res.status(404).json({ error: 'Blog post not found' });
+  }
+  
+  post.published = !post.published;
+  res.json({ 
+    message: `Post ${post.published ? 'published' : 'unpublished'} successfully`,
+    post 
+  });
+});
+
+// Delete blog post and its file
+app.delete('/api/blog/:id', (req, res) => {
+  const postId = parseInt(req.params.id);
+  const postIndex = blogPosts.findIndex(p => p.id === postId);
+  
+  if (postIndex === -1) {
+    return res.status(404).json({ error: 'Blog post not found' });
+  }
+  
+  const post = blogPosts[postIndex];
+  
+  // Delete the uploaded file if it exists
+  if (post.filePath && fs.existsSync(post.filePath)) {
+    try {
+      fs.unlinkSync(post.filePath);
+      console.log(`Deleted file: ${post.filePath}`);
+    } catch (error) {
+      console.error(`Error deleting file: ${error.message}`);
+    }
+  }
+  
+  // Remove from blog posts array
+  blogPosts.splice(postIndex, 1);
+  
+  res.json({ 
+    message: 'Blog post and associated file deleted successfully',
+    deletedPost: post
+  });
+});
 
 // Main page
 app.get('/', (req, res) => {
@@ -264,11 +391,23 @@ app.get('/', (req, res) => {
                 
                 <h3 style="margin-top: 30px;">Upload New Article</h3>
                 <div class="upload-area">
-                    <p>Upload a DOCX file to create a new blog post</p>
-                    <form action="/api/blog/upload" method="post" enctype="multipart/form-data">
-                        <input type="file" name="docx" accept=".docx" required class="btn">
-                        <button type="submit" class="btn">Upload Article</button>
+                    <p><strong>Upload DOCX files to automatically create blog posts</strong></p>
+                    <p style="font-size: 14px; color: #666; margin: 10px 0;">
+                        • Files are saved to: <code>/uploads/</code> directory<br>
+                        • Text content is extracted using Mammoth library<br>
+                        • Posts are created as drafts (unpublished by default)<br>
+                        • Article title comes from filename or first line of content
+                    </p>
+                    <form action="/api/blog/upload" method="post" enctype="multipart/form-data" id="upload-form">
+                        <input type="file" name="docx" accept=".docx" required class="btn" id="file-input">
+                        <button type="submit" class="btn">Upload & Process DOCX</button>
                     </form>
+                    <div id="upload-status" style="margin-top: 15px;"></div>
+                </div>
+                
+                <h3 style="margin-top: 30px;">Blog Management</h3>
+                <div id="admin-blog-content">
+                    <p>Loading blog management panel...</p>
                 </div>
             </div>
             
@@ -364,6 +503,102 @@ app.get('/', (req, res) => {
                     \`).join('');
                     document.getElementById('blog-content').innerHTML = html || '<p>No published blog posts yet.</p>';
                 });
+
+            // Load admin blog management
+            fetch('/api/blog/admin')
+                .then(res => res.json())
+                .then(data => {
+                    const html = data.map(post => {
+                        return '<div class="item" style="border-left-color: ' + (post.published ? '#10b981' : '#ef4444') + ';">' +
+                            '<div style="display: flex; justify-content: space-between; align-items: center;">' +
+                                '<div style="flex: 1;">' +
+                                    '<h4>' + post.title + '</h4>' +
+                                    '<p style="font-size: 13px; color: #666;">' +
+                                        'Status: <strong>' + (post.published ? 'Published' : 'Draft') + '</strong> | ' +
+                                        'Words: ' + post.wordCount + ' | ' +
+                                        'File: ' + (post.fileExists ? '✓ Saved' : '✗ Missing') +
+                                        (post.originalFileName ? ' (' + post.originalFileName + ')' : '') +
+                                    '</p>' +
+                                    '<p style="font-size: 14px; margin: 8px 0;">' + post.excerpt + '</p>' +
+                                    (post.tags ? '<div>' + post.tags.map(tag => '<span class="tech-tag" style="font-size: 11px;">' + tag + '</span>').join('') + '</div>' : '') +
+                                '</div>' +
+                                '<div style="margin-left: 15px;">' +
+                                    '<button onclick="togglePublish(' + post.id + ', ' + post.published + ')" class="btn" style="margin: 2px; font-size: 12px; padding: 6px 12px;">' +
+                                        (post.published ? 'Unpublish' : 'Publish') +
+                                    '</button>' +
+                                    '<button onclick="deletePost(' + post.id + ')" class="btn" style="margin: 2px; font-size: 12px; padding: 6px 12px; background: #ef4444;">' +
+                                        'Delete' +
+                                    '</button>' +
+                                '</div>' +
+                            '</div>' +
+                        '</div>';
+                    }).join('');
+                    document.getElementById('admin-blog-content').innerHTML = html || '<p>No blog posts yet.</p>';
+                });
+
+            // Handle DOCX upload with progress
+            document.getElementById('upload-form').addEventListener('submit', function(e) {
+                e.preventDefault();
+                const fileInput = document.getElementById('file-input');
+                const statusDiv = document.getElementById('upload-status');
+                
+                if (!fileInput.files[0]) {
+                    statusDiv.innerHTML = '<p style="color: #ef4444;">Please select a DOCX file</p>';
+                    return;
+                }
+                
+                const formData = new FormData();
+                formData.append('docx', fileInput.files[0]);
+                
+                statusDiv.innerHTML = '<p style="color: #3b82f6;">Processing DOCX file...</p>';
+                
+                fetch('/api/blog/upload', {
+                    method: 'POST',
+                    body: formData
+                })
+                .then(res => res.json())
+                .then(data => {
+                    if (data.error) {
+                        statusDiv.innerHTML = \`<p style="color: #ef4444;">Error: \${data.error}</p>\`;
+                    } else {
+                        statusDiv.innerHTML = \`
+                            <p style="color: #10b981;">✓ Article created successfully!</p>
+                            <p style="font-size: 14px;">Title: <strong>\${data.post.title}</strong></p>
+                            <p style="font-size: 14px;">Content: \${data.extractedLength} characters extracted</p>
+                            <p style="font-size: 14px;">Status: Draft (ready to publish)</p>
+                        \`;
+                        fileInput.value = '';
+                        // Refresh the admin panel
+                        setTimeout(() => location.reload(), 2000);
+                    }
+                })
+                .catch(error => {
+                    statusDiv.innerHTML = \`<p style="color: #ef4444;">Upload failed: \${error.message}</p>\`;
+                });
+            });
+
+            // Blog management functions
+            function togglePublish(postId, isPublished) {
+                fetch(\`/api/blog/\${postId}/publish\`, { method: 'PATCH' })
+                    .then(res => res.json())
+                    .then(data => {
+                        alert(data.message);
+                        location.reload();
+                    })
+                    .catch(error => alert('Error: ' + error.message));
+            }
+
+            function deletePost(postId) {
+                if (confirm('Are you sure you want to delete this post and its file?')) {
+                    fetch(\`/api/blog/\${postId}\`, { method: 'DELETE' })
+                        .then(res => res.json())
+                        .then(data => {
+                            alert(data.message);
+                            location.reload();
+                        })
+                        .catch(error => alert('Error: ' + error.message));
+                }
+            }
         </script>
     </body>
     </html>
